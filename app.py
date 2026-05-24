@@ -206,7 +206,7 @@ If a numeric field is unclear or missing, use null. Extract every visible line i
 BENCHMARK_PROMPT = """You are a senior procurement specialist with 10+ years in Vietnam beer/FMCG industry.
 You have deep market knowledge of POSM production costs, agency service fees, and activation pricing in Vietnam.
 
-Below are line items from a vendor quotation. For each item, provide your market intelligence:
+Below are line items from a vendor quotation. For each item, provide market benchmark intelligence.
 
 Currency context: {currency}
 Market: Vietnam (Ho Chi Minh City / Hanoi tier-1 pricing, 2024-2025)
@@ -214,22 +214,32 @@ Market: Vietnam (Ho Chi Minh City / Hanoi tier-1 pricing, 2024-2025)
 Line items to analyze:
 {items}
 
-For each item, add these fields to the existing object:
-- "market_price_min": estimated minimum market price per unit (numeric, same currency)
-- "market_price_max": estimated maximum market price per unit (numeric, same currency)
-- "market_midpoint": midpoint of market range (numeric)
-- "verdict": one of "REASONABLE" | "SLIGHTLY HIGH" | "HIGH" | "VERY HIGH" | "LOW" | "CHECK SPEC"
-  - REASONABLE: within ±15% of market midpoint
-  - SLIGHTLY HIGH: 15-30% above market
-  - HIGH: 30-60% above market
-  - VERY HIGH: >60% above market
-  - LOW: >15% below market (may indicate quality compromise)
-  - CHECK SPEC: unable to benchmark reliably (custom/unclear spec)
-- "deviation_pct": percentage deviation from market midpoint (positive = overpriced, negative = underpriced), null if CHECK SPEC
-- "market_notes": 1-2 sentences explaining the market benchmark (what drives the price, typical specs)
-- "negotiation_tip": 1 specific, actionable negotiation tip for this item
+CRITICAL RULES — follow exactly:
+1. market_price_min, market_price_max, market_midpoint are all PER UNIT prices.
+2. Use EXACT numbers in {currency} — SAME SCALE as the unit_price in the input data.
+   - If unit_price = 150000 (VND), market prices should be like 100000–180000. NOT 100–180. NOT 0.1–0.18.
+   - Look at the unit_price value and use the same order of magnitude.
+3. deviation_pct = round( (unit_price - market_midpoint) / market_midpoint * 100, 1 )
+   - Compare UNIT PRICE vs MARKET MIDPOINT only. Do NOT use total_price here.
+   - Positive = vendor overcharging, Negative = below market.
+4. Verdict thresholds based on deviation_pct:
+   - REASONABLE:    |deviation_pct| <= 15
+   - SLIGHTLY HIGH: deviation_pct 15–30
+   - HIGH:          deviation_pct 30–60
+   - VERY HIGH:     deviation_pct > 60
+   - LOW:           deviation_pct < -15 (possible quality concern)
+   - CHECK SPEC:    cannot assess (non-standard or unclear spec)
 
-Return ONLY a valid JSON array with all original fields plus the new benchmark fields. No markdown, no explanation.
+Fields to add to each item:
+- "market_price_min": min market unit price (numeric, same scale as unit_price)
+- "market_price_max": max market unit price (numeric, same scale as unit_price)
+- "market_midpoint": (market_price_min + market_price_max) / 2
+- "verdict": see thresholds above
+- "deviation_pct": (unit_price - market_midpoint) / market_midpoint * 100, rounded 1 decimal. null if CHECK SPEC.
+- "market_notes": 1-2 sentences on price drivers and typical specs in Vietnam market
+- "negotiation_tip": 1 specific, actionable negotiation tip for this line item
+
+Return ONLY a valid JSON array with all original fields plus the new fields. No markdown, no explanation.
 """
 
 INSIGHTS_PROMPT = """You are a strategic procurement advisor for a major beer company in Vietnam.
@@ -286,6 +296,52 @@ def parse_json_response(text: str):
             pass
     return None
 
+
+
+def calc_market_total(items: list) -> float:
+    """
+    Compute total market reference value using deviation_pct to avoid scale issues.
+
+    Formula per item:
+      deviation_pct = (unit_price - market_midpoint) / market_midpoint * 100
+      => market_total_item = total_price / (1 + deviation_pct / 100)
+
+    Falls back to quantity * market_midpoint (with scale sanity-check) when
+    deviation_pct is missing, then to total_price as last resort.
+    """
+    total = 0.0
+    for item in items:
+        total_price = float(item.get("total_price") or 0)
+        dev_pct     = item.get("deviation_pct")
+        qty         = float(item.get("quantity") or 1)
+        unit_price  = float(item.get("unit_price") or 0)
+        market_mid  = item.get("market_midpoint")
+
+        # Primary: back-calculate from deviation_pct (avoids scale ambiguity)
+        if dev_pct is not None:
+            try:
+                factor = 1 + float(dev_pct) / 100
+                if factor > 0 and total_price > 0:
+                    total += total_price / factor
+                    continue
+            except Exception:
+                pass
+
+        # Fallback: quantity * market_midpoint (sanity-check scale vs unit_price)
+        if market_mid is not None and qty > 0:
+            try:
+                mid = float(market_mid)
+                if unit_price > 0 and mid > 0:
+                    ratio = unit_price / mid
+                    if 0.05 <= ratio <= 20:   # within ~1 order of magnitude
+                        total += qty * mid
+                        continue
+            except Exception:
+                pass
+
+        # Last resort: assume 0% deviation
+        total += total_price
+    return total
 
 def fmt_currency(value, currency="VND"):
     if value is None:
@@ -418,10 +474,7 @@ def generate_insights(benchmarked: list, currency: str, api_key: str):
     client = _groq_client(api_key)
 
     total_quoted = sum(float(i.get("total_price") or 0) for i in benchmarked)
-    total_market = sum(
-        float(i.get("quantity") or 0) * float(i.get("market_midpoint") or i.get("unit_price") or 0)
-        for i in benchmarked
-    )
+    total_market = calc_market_total(benchmarked)
     overprice_pct = ((total_quoted - total_market) / total_market * 100) if total_market else 0
 
     prompt = INSIGHTS_PROMPT.format(
@@ -476,10 +529,7 @@ def render_stepper(current: int):
 
 def render_stat_row(items: list, currency: str):
     total_quoted = sum(float(i.get("total_price") or 0) for i in items)
-    total_market = sum(
-        float(i.get("quantity") or 0) * float(i.get("market_midpoint") or i.get("unit_price") or 0)
-        for i in items
-    )
+    total_market = calc_market_total(items)
     overpriced = sum(1 for i in items if i.get("verdict") in ("HIGH", "VERY HIGH", "SLIGHTLY HIGH"))
     pct = ((total_quoted - total_market) / total_market * 100) if total_market else 0
     color = "sv-green" if pct <= 15 else "sv-amber" if pct <= 30 else "sv-red"
@@ -1071,7 +1121,7 @@ def step_report(currency: str):
             st.rerun()
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────
 def main():
     api_key, currency = render_sidebar()
     render_header()
